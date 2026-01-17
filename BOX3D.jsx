@@ -84,10 +84,13 @@ function calculateConstraints(config) {
         lidEnabled, lidType, 
         lidThickness: lidThick_IU, 
         lipDepth: lipDepth_IU,
-        tolerance: tolerance_IU
+        tolerance: tolerance_IU,
+        holes, holeSize, infill
     } = config;
 
     const isGridfinity = appMode === 'gridfinity';
+    const errors = [];
+    const warnings = {}; // Object map for per-control warnings
     
     // Constants in IU
     const grid42_IU = 42 * IU_PER_MM;
@@ -95,7 +98,24 @@ function calculateConstraints(config) {
     const lipHeight_IU = 440000; // 4.4mm * 100k
     const railCapH_IU = 200000;  // 2.0mm * 100k
     
-    // 1. Horizontal Plane
+    // --- VALIDATION CHECKS (Mapped to Controls) ---
+    // 1. Structural Thinness
+    if (wall_IU < 80000) warnings.wall = "Fragile (< 0.8mm)";
+    if (floor_IU < 80000) warnings.floor = "Risk of warping (< 0.8mm)";
+
+    // 2. Lid Logic
+    if (lidEnabled) {
+        if (tolerance_IU === 0) warnings.tolerance = "0 tolerance: Force fit?";
+        if (lidThick_IU < 40000) warnings.lidThickness = "Too thin (< 0.4mm)";
+    }
+
+    // 3. Hex Pattern
+    if (holes) {
+        if (holeSize < 200000) warnings.holeSize = "Too small (< 2mm)";
+        if (infill < 0.25) warnings.infill = "Weak structure (< 25%)";
+    }
+
+    // 4. Horizontal Plane & Bed Size
     let outerW_IU = 0, outerD_IU = 0;
     let innerW_IU = 0, innerD_IU = 0;
 
@@ -116,7 +136,21 @@ function calculateConstraints(config) {
         innerD_IU = Math.max(0, outerD_IU - (wall_IU * 2));
     }
 
-    // 2. Vertical Stack (Cursor)
+    // Check Bed Size (250mm limit)
+    const MAX_DIM_IU = 250 * IU_PER_MM;
+    const sizeWarn = "Exceeds 250mm";
+    if (outerW_IU > MAX_DIM_IU) {
+        if (isGridfinity) warnings.gridWidth = sizeWarn;
+        else warnings.width = sizeWarn;
+    }
+    if (outerD_IU > MAX_DIM_IU) {
+        if (isGridfinity) warnings.gridDepth = sizeWarn;
+        else warnings.depth = sizeWarn;
+    }
+
+    if (innerW_IU <= 0 || innerD_IU <= 0) errors.push("Walls are too thick for the defined width/depth.");
+
+    // 5. Vertical Stack (Cursor)
     let cursorY_IU = 0;
     const stack = { feet: null, floor: null, wall: null, rail: null, lip: null, lid: null };
     
@@ -137,23 +171,32 @@ function calculateConstraints(config) {
     
     if (isGridfinity) {
         const stackingHeight_IU = gridHeight * grid7_IU; 
-        targetWallH_IU = Math.max(100000, stackingHeight_IU - cursorY_IU);
+        targetWallH_IU = stackingHeight_IU - cursorY_IU;
+        
+        if (targetWallH_IU < 10000) errors.push("Gridfinity Unit count too low for feet+floor height.");
+        else targetWallH_IU = Math.max(10000, targetWallH_IU);
+
+        // Check vertical bed limits for Gridfinity
+        if (stackingHeight_IU > MAX_DIM_IU) warnings.gridHeight = sizeWarn;
+
         stack.bodyH = toScene(stackingHeight_IU);
     } 
     else if (measureMode === 'internal') {
         // INTERNAL MODE: height_IU is usable capacity.
         targetWallH_IU = height_IU;
-        // If Step Lid, add insert depth so usable capacity remains true
         if (lidEnabled && lidType === 'step') {
             targetWallH_IU += lipDepth_IU;
         }
+        
+        // Calculate total external height approx to check bed limits
+        const totalEstH = targetWallH_IU + cursorY_IU + (lidEnabled && lidType === 'slide' ? 500000 : 0);
+        if (totalEstH > MAX_DIM_IU) warnings.height = sizeWarn;
     } 
     else {
         // EXTERNAL MODE
         let nonWallStack_IU = cursorY_IU; 
         
         if (lidEnabled && lidType === 'slide') {
-             // Rail Spacer gap = Lid Thickness + Tolerance
              const railSpacer_IU = lidThick_IU + tolerance_IU; 
              const totalRail_IU = railCapH_IU + railSpacer_IU;
              nonWallStack_IU += totalRail_IU;
@@ -161,7 +204,11 @@ function calculateConstraints(config) {
              nonWallStack_IU += lidThick_IU;
         }
 
-        targetWallH_IU = Math.max(100000, height_IU - nonWallStack_IU);
+        targetWallH_IU = height_IU - nonWallStack_IU;
+        if (targetWallH_IU <= 0) errors.push("External height is too short for the floor and lid components.");
+        targetWallH_IU = Math.max(10000, targetWallH_IU);
+
+        if (height_IU > MAX_DIM_IU) warnings.height = sizeWarn;
     }
 
     const wallStart_IU = cursorY_IU;
@@ -176,7 +223,6 @@ function calculateConstraints(config) {
     }
     else if (lidEnabled && !isGridfinity) {
         if (lidType === 'slide') {
-            // Gap logic: Gap = Thickness + Tolerance
             const spacerH_IU = lidThick_IU + tolerance_IU; 
             const spacerStart_IU = cursorY_IU;
             cursorY_IU += spacerH_IU;
@@ -189,14 +235,11 @@ function calculateConstraints(config) {
                 cap: { yMin: toScene(capStart_IU), yMax: toScene(capStart_IU + railCapH_IU) }
             };
 
-            // Lid Dimensions with Tolerance
             stack.lid = {
-                yPos: toScene(spacerStart_IU + (lidThick_IU/2)), // Visual center inside gap (ignores loose tolerance drop)
+                yPos: toScene(spacerStart_IU + (lidThick_IU/2)),
                 type: 'slide',
                 thickness: toScene(lidThick_IU),
-                // Width: Outer Width - Wall - Tolerance
                 width: toScene(outerW_IU - wall_IU - tolerance_IU), 
-                // Depth: Outer Depth - Tolerance (clearance for sliding mechanism if any, usually flush with back/front but loose)
                 depth: toScene(outerD_IU - tolerance_IU)
             };
         }
@@ -223,8 +266,9 @@ function calculateConstraints(config) {
         innerH: toScene(stack.wall.yMax - stack.floor.yMax),
         bodyH: stack.bodyH, 
         stack: stack,
-        valid: true,
-        errors: []
+        valid: errors.length === 0,
+        errors: errors,
+        warnings: warnings
     };
 }
 
@@ -275,6 +319,21 @@ function generateSTL(scene) {
 }
 
 // --- UI Components ---
+function AlertBlock({ type, messages }) {
+    if (!messages || messages.length === 0) return null;
+    // Only used for global errors now
+    if (type !== 'error') return null;
+    
+    return (
+        <div className="mb-4 p-3 border rounded text-xs bg-red-900/40 border-red-700/50 text-red-200">
+            <strong className="block mb-1 font-bold text-red-400">Configuration Error</strong>
+            <ul className="list-disc pl-4 space-y-0.5 opacity-90">
+                {messages.map((m, i) => <li key={i}>{m}</li>)}
+            </ul>
+        </div>
+    );
+}
+
 function SegmentedControl({ options, value, onChange, disabled }) {
     return (
         <div className={`flex w-full mb-5 bg-gray-900/50 p-1 rounded-lg border border-gray-700 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}>
@@ -299,7 +358,6 @@ function ControlInput({ label, value, min, max, step, onChange, unitLabel, error
     const isInch = unitLabel === 'in'; 
     const format = (v) => {
         if (unitLabel === '%') return Math.round(v).toString();
-        // If MM, usually 1 decimal is enough. If Inch, 3 decimals.
         return unitLabel === 'in' ? v.toFixed(3) : v.toFixed(1);
     };
 
@@ -322,15 +380,14 @@ function ControlInput({ label, value, min, max, step, onChange, unitLabel, error
     const onBlur = () => commit(localVal);
     const onKeyDown = (e) => { if(e.key === 'Enter') commit(localVal); };
 
-    // Calculate percentage for the blue track fill
     const percentage = max > min ? Math.min(100, Math.max(0, ((value - min) / (max - min)) * 100)) : 0;
 
     return (
         <div className={`mb-5 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}>
             <div className="flex justify-between items-baseline mb-1">
                 <span className="text-gray-300 font-bold text-xs">{label}</span>
-                {error ? <span className="text-red-400 font-bold text-xs">{error}</span> : 
-                 warning ? <span className="text-amber-500 font-bold text-xs">{warning}</span> : null}
+                {warning && <span className="text-amber-500 font-bold text-[10px] animate-pulse">{warning}</span>}
+                {error && <span className="text-red-400 font-bold text-xs">{error}</span>}
             </div>
             {description && (
                 <p className="text-[10px] text-gray-500 mb-2 leading-tight">{description}</p>
@@ -439,7 +496,7 @@ export default function App() {
               value: valIU / IU_PER_MM,
               min: minIn * 25.4,
               max: maxIn * 25.4,
-              step: 0.1, // Finer step for tolerances
+              step: 0.1, 
               unitLabel: 'mm',
               onChange: (v) => updateConfig(key, Math.round(v * IU_PER_MM))
           };
@@ -456,7 +513,6 @@ export default function App() {
   };
 
   const isGridfinity = appMode === 'gridfinity';
-  // DEFINED for Labels
   const isMM = appMode === 'mm' || isGridfinity; 
   
   const layout = useMemo(() => calculateConstraints({ ...config, appMode }), [config, appMode]);
@@ -1014,7 +1070,9 @@ export default function App() {
     <div className="flex flex-col md:flex-row h-screen bg-gray-900 font-sans select-none text-gray-200 overflow-hidden">
         <div ref={mountRef} className="flex-1 relative bg-gray-900 min-w-0 min-h-0"></div>
         <div className="w-full md:w-80 h-2/5 md:h-full bg-gray-800 border-t md:border-t-0 md:border-l border-gray-700 p-6 overflow-y-auto flex-shrink-0 z-10 shadow-xl md:shadow-none">
-            <h1 className="text-xl font-bold text-white mb-6">BOX3D -- 3D Printable Box & Gridfinity Generator</h1>
+            <h1 className="text-xl font-bold text-white mb-6">BOX3D -- <span className="text-blue-400">3D Printable Box & Gridfinity Generator</span></h1>
+            
+
             <SegmentedControl options={[ { label: 'Inch', value: 'in' }, { label: 'mm', value: 'mm' }, { label: 'Gridfinity', value: 'gridfinity' } ]} value={appMode} onChange={setAppMode} />
             
             <div className="mb-6 space-y-4">
@@ -1026,23 +1084,23 @@ export default function App() {
                 )}
                 {appMode === 'gridfinity' ? (
                     <>
-                        <ControlInput label="Width (Units)" description="42mm blocks" unitLabel={null} value={config.gridWidth} min={1} max={10} step={1} onChange={v => updateConfig('gridWidth', v)} />
-                        <ControlInput label="Depth (Units)" description="42mm blocks" unitLabel={null} value={config.gridDepth} min={1} max={10} step={1} onChange={v => updateConfig('gridDepth', v)} />
-                        {config.gridfinityType === 'bin' && <ControlInput label="Height (Units)" description="7mm vertical blocks" unitLabel={null} value={config.gridHeight} min={2} max={20} step={1} onChange={v => updateConfig('gridHeight', v)} />}
+                        <ControlInput label="Width (Units)" description="42mm blocks" unitLabel={null} value={config.gridWidth} min={1} max={10} step={1} onChange={v => updateConfig('gridWidth', v)} warning={layout.warnings.gridWidth} />
+                        <ControlInput label="Depth (Units)" description="42mm blocks" unitLabel={null} value={config.gridDepth} min={1} max={10} step={1} onChange={v => updateConfig('gridDepth', v)} warning={layout.warnings.gridDepth} />
+                        {config.gridfinityType === 'bin' && <ControlInput label="Height (Units)" description="7mm vertical blocks" unitLabel={null} value={config.gridHeight} min={2} max={20} step={1} onChange={v => updateConfig('gridHeight', v)} warning={layout.warnings.gridHeight} />}
                     </>
                 ) : (
                     <>
-                        <ControlInput label="Width" unitLabel={appMode} {...getDisplayProps('width', 0.5, 24)} />
-                        <ControlInput label="Depth" unitLabel={appMode} {...getDisplayProps('depth', 0.5, 24)} />
-                        <ControlInput label="Height" unitLabel={appMode} {...getDisplayProps('height', 0.5, 24)} />
+                        <ControlInput label="Width" unitLabel={appMode} {...getDisplayProps('width', 0.5, 24)} warning={layout.warnings.width} />
+                        <ControlInput label="Depth" unitLabel={appMode} {...getDisplayProps('depth', 0.5, 24)} warning={layout.warnings.depth} />
+                        <ControlInput label="Height" unitLabel={appMode} {...getDisplayProps('height', 0.5, 24)} warning={layout.warnings.height} />
                     </>
                 )}
             </div>
 
             {(!isGridfinity || config.gridfinityType === 'bin') && (
                 <div className="mb-6 space-y-4 pt-4 border-t border-gray-700">
-                    <ControlInput label="Wall Thickness" description="Structural walls" {...getStructProps('wall', 0.03, 0.5)} />
-                    <ControlInput label="Floor Thickness" description="Bottom plate" {...getStructProps('floor', 0.03, 0.5)} />
+                    <ControlInput label="Wall Thickness" description="Structural walls" {...getStructProps('wall', 0.03, 0.5)} warning={layout.warnings.wall} />
+                    <ControlInput label="Floor Thickness" description="Bottom plate" {...getStructProps('floor', 0.03, 0.5)} warning={layout.warnings.floor} />
                     
                     <div className="pt-2 pb-2">
                         <label className="flex items-center justify-between cursor-pointer mb-3">
@@ -1051,8 +1109,8 @@ export default function App() {
                         </label>
                         {config.holes && (
                             <>
-                                <ControlInput label="Hex Size" description="Hole Diameter" {...getDisplayProps('holeSize', 0.1, 2.0)} />
-                                <ControlInput label="Wall Solidity" description="Structure remaining %" value={config.infill * 100} min={10} max={99} step={1} onChange={v => updateConfig('infill', v/100)} unitLabel="%" />
+                                <ControlInput label="Hex Size" description="Hole Diameter" {...getDisplayProps('holeSize', 0.1, 2.0)} warning={layout.warnings.holeSize} />
+                                <ControlInput label="Wall Solidity" description="Structure remaining %" value={config.infill * 100} min={10} max={99} step={1} onChange={v => updateConfig('infill', v/100)} unitLabel="%" warning={layout.warnings.infill} />
                             </>
                         )}
                     </div>
@@ -1063,9 +1121,9 @@ export default function App() {
                             {config.lidEnabled && (
                                 <>
                                     <SegmentedControl options={[ { label: 'Step (Friction)', value: 'step' }, { label: 'Slide (Rail)', value: 'slide' } ]} value={config.lidType} onChange={v => updateConfig('lidType', v)} />
-                                    <ControlInput label="Lid Thickness" {...getStructProps('lidThickness', 0.04, 0.5)} />
+                                    <ControlInput label="Lid Thickness" {...getStructProps('lidThickness', 0.04, 0.5)} warning={layout.warnings.lidThickness} />
                                     {config.lidType === 'step' && <ControlInput label="Insert Depth" description="Depth of plug" {...getStructProps('lipDepth', 0.04, 1.0)} /> }
-                                    <ControlInput label="Tolerance" description="Fit clearance" {...getStructProps('tolerance', 0.0, 0.05)} />
+                                    <ControlInput label="Tolerance" description="Fit clearance" {...getStructProps('tolerance', 0.0, 0.05)} warning={layout.warnings.tolerance} />
                                 </>
                             )}
                         </div>
@@ -1073,8 +1131,12 @@ export default function App() {
                 </div>
             )}
             
+
             <div className="mt-4 pt-4 border-t border-gray-700">
                 <label className="flex items-center cursor-pointer mb-4"><input type="checkbox" checked={showMeasure} onChange={e => setShowMeasure(e.target.checked)} className="mr-2 accent-green-500" /><span className="text-sm font-bold text-green-400">Show Dimensions</span></label>
+                
+                <AlertBlock type="error" messages={layout.errors} />
+
                 <button onClick={handleExport} className="w-full py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded shadow-lg transition-all">Download .STL</button>
             </div>
             
