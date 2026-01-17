@@ -262,15 +262,15 @@ function generateSTL(scene) {
 // --- UI Components ---
 function SegmentedControl({ options, value, onChange, disabled }) {
     return (
-        <div className={`flex w-full mb-4 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}>
+        <div className={`flex w-full mb-5 bg-gray-900/50 p-1 rounded-lg border border-gray-700 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}>
             {options.map((opt) => (
                 <button
                     key={opt.value}
                     onClick={() => onChange(opt.value)}
-                    className={`flex-1 py-2 text-xs font-bold transition-all border-b-2 ${
+                    className={`flex-1 py-1.5 text-xs font-bold rounded-md transition-all duration-200 ${
                         value === opt.value
-                        ? 'border-blue-500 text-white'
-                        : 'border-transparent text-gray-500 hover:text-gray-300'
+                        ? 'bg-blue-600 text-white shadow-sm ring-1 ring-white/10'
+                        : 'text-gray-400 hover:text-gray-200 hover:bg-white/5'
                     }`}
                 >
                     {opt.label}
@@ -306,6 +306,9 @@ function ControlInput({ label, value, min, max, step, onChange, unitLabel, error
     const onBlur = () => commit(localVal);
     const onKeyDown = (e) => { if(e.key === 'Enter') commit(localVal); };
 
+    // Calculate percentage for the blue track fill
+    const percentage = max > min ? Math.min(100, Math.max(0, ((value - min) / (max - min)) * 100)) : 0;
+
     return (
         <div className={`mb-5 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}>
             <div className="flex justify-between items-baseline mb-1">
@@ -324,7 +327,10 @@ function ControlInput({ label, value, min, max, step, onChange, unitLabel, error
                     step={step}
                     value={value} 
                     onChange={(e) => onChange(parseFloat(e.target.value))}
-                    className={`flex-1 h-1.5 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500`}
+                    className="flex-1 h-1.5 rounded-lg appearance-none cursor-pointer 
+                    [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:bg-blue-400 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:transition-all [&::-webkit-slider-thumb]:hover:scale-110
+                    [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:bg-blue-400 [&::-moz-range-thumb]:border-none [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:shadow-md [&::-moz-range-thumb]:transition-all [&::-moz-range-thumb]:hover:scale-110"
+                    style={{ background: `linear-gradient(to right, #2563eb ${percentage}%, #374151 ${percentage}%)` }}
                 />
                 <div className="flex items-center bg-gray-800 rounded px-2 py-1 border border-gray-700">
                     <input 
@@ -370,7 +376,7 @@ export default function App() {
       gridDepth: 3,
       gridHeight: 6, 
       holes: false,
-      holeSize: 0.15 
+      holeSize: 0.25 
   });
 
   const updateConfig = (key, value) => {
@@ -529,10 +535,11 @@ export default function App() {
         color: "#3b82f6", roughness: 0.5, metalness: 0.1
     });
 
-    const addMesh = (geo, x, y, z, rotX=0, mat=material) => {
+    const addMesh = (geo, x, y, z, rotX=0, rotY=0, mat=material) => {
         const mesh = new THREE.Mesh(geo, mat);
         mesh.position.set(x, y, z);
         if(rotX) mesh.rotation.x = rotX;
+        if(rotY) mesh.rotation.y = rotY;
         mesh.castShadow = true;
         mesh.receiveShadow = true;
         group.add(mesh);
@@ -642,27 +649,111 @@ export default function App() {
     if (stack.wall) {
         const h = stack.wall.yMax - stack.wall.yMin + GEO_OVERLAP;
         const y = stack.wall.yMin - GEO_OVERLAP;
-        
-        const shape = new THREE.Shape();
-        shape.moveTo(-outerW/2, -outerD/2);
-        shape.lineTo(outerW/2, -outerD/2);
-        shape.lineTo(outerW/2, outerD/2);
-        shape.lineTo(-outerW/2, outerD/2);
-        shape.lineTo(-outerW/2, -outerD/2);
-        
-        const iw = outerW - (wall*2);
-        const id = outerD - (wall*2);
-        const inner = new THREE.Path();
-        inner.moveTo(-iw/2, -id/2);
-        inner.lineTo(iw/2, -id/2);
-        inner.lineTo(iw/2, id/2);
-        inner.lineTo(-iw/2, id/2);
-        inner.lineTo(-iw/2, -id/2);
-        shape.holes.push(inner);
 
-        const geo = new THREE.ExtrudeGeometry(shape, { depth: h, bevelEnabled: false, curveSegments: 1 });
-        geo.rotateX(-Math.PI/2);
-        addMesh(geo, boxOffsetX, y, 0);
+        if (holes) {
+            // --- PATTERNED WALLS (4 separate meshes with boolean-style holes in 2D) ---
+            const createPerforatedWall = (w, height, thick) => {
+                const shape = new THREE.Shape();
+                shape.moveTo(-w/2, 0);
+                shape.lineTo(w/2, 0);
+                shape.lineTo(w/2, height);
+                shape.lineTo(-w/2, height);
+                shape.lineTo(-w/2, 0);
+
+                const hexR = holeSize / 2;
+                const hexW = hexR * Math.sqrt(3);
+                const hexH = hexR * 2;
+                const spacingX = hexW * 1.05; // Tight packing
+                const spacingY = hexH * 0.8; // 30-60-90 triangle stacking
+
+                // Grid logic
+                const margin = thick * 1.5;
+                const availW = w - (margin * 2);
+                const availH = height - (margin * 2);
+                
+                const startX = -w/2 + margin + hexR;
+                const startY = margin + hexR;
+
+                const cols = Math.floor(availW / spacingX);
+                const rows = Math.floor(availH / spacingY);
+
+                if (cols > 0 && rows > 0) {
+                    for(let r=0; r<rows; r++) {
+                        for(let c=0; c<cols; c++) {
+                            const isOddRow = r % 2 === 1;
+                            const offsetX = isOddRow ? spacingX / 2 : 0;
+                            // Don't add if odd row pushes it out
+                            if (isOddRow && c === cols - 1) continue; 
+
+                            const cx = startX + (c * spacingX) + offsetX;
+                            const cy = startY + (r * spacingY);
+                            
+                            // Bounds Check
+                            if (cx > w/2 - margin || cy > height - margin) continue;
+
+                            const hex = createHexagonPath(cx, cy, hexR);
+                            shape.holes.push(hex);
+                        }
+                    }
+                }
+
+                const geo = new THREE.ExtrudeGeometry(shape, { depth: thick, bevelEnabled: false });
+                return geo;
+            };
+
+            // Front & Back (Full Width)
+            const fbGeo = createPerforatedWall(outerW, h, wall);
+            // Position: Center of wall thickness should align with outerD edge?
+            // Extrude creates depth +Z.
+            // Front Wall: At +outerD/2. We want outer face at +D/2. So mesh at D/2 - wall.
+            addMesh(fbGeo, boxOffsetX, y, outerD/2 - wall, 0, 0); // Front (Inner face at D/2-w, Outer at D/2) -> No, extrude is +Z.
+                                                                  // If we place at Z, extrude goes to Z+Thick. 
+                                                                  // We want outer face at outerD/2. So Z = outerD/2 - wall.
+            
+            // Back Wall: At -outerD/2. We want outer face at -D/2. So mesh at -D/2, extrude to -D/2+wall.
+            // Wait, let's rotate back wall 180 to face out? Or just place it.
+            // Let's place it at -outerD/2.
+            addMesh(fbGeo, boxOffsetX, y, -outerD/2, 0, 0); 
+
+            // Left & Right (Inset by wall thickness to avoid overlap)
+            // Width = outerD - 2*wall
+            const sideW = outerD - (wall * 2.05); // slight gap for tolerance visually
+            const lrGeo = createPerforatedWall(sideW, h, wall);
+            
+            // Right Wall (+X): Rotated -90 deg around Y? 
+            // Shape is in XY. Rotate Y -90 -> Shape in YZ (facing -X). Extrude in -X.
+            // Let's keep it simple. Rotate Y 90. Shape in YZ (facing +X). Extrude +X.
+            // We want outer face at outerW/2. So place at outerW/2 - wall.
+            addMesh(lrGeo, boxOffsetX + outerW/2 - wall, y, 0, 0, Math.PI/2);
+
+            // Left Wall (-X):
+            // Place at -outerW/2. Extrude +X to -outerW/2 + wall.
+            addMesh(lrGeo, boxOffsetX - outerW/2, y, 0, 0, Math.PI/2);
+
+
+        } else {
+            // --- SOLID WALLS (Optimized Extrusion) ---
+            const shape = new THREE.Shape();
+            shape.moveTo(-outerW/2, -outerD/2);
+            shape.lineTo(outerW/2, -outerD/2);
+            shape.lineTo(outerW/2, outerD/2);
+            shape.lineTo(-outerW/2, outerD/2);
+            shape.lineTo(-outerW/2, -outerD/2);
+            
+            const iw = outerW - (wall*2);
+            const id = outerD - (wall*2);
+            const inner = new THREE.Path();
+            inner.moveTo(-iw/2, -id/2);
+            inner.lineTo(iw/2, -id/2);
+            inner.lineTo(iw/2, id/2);
+            inner.lineTo(-iw/2, id/2);
+            inner.lineTo(-iw/2, -id/2);
+            shape.holes.push(inner);
+
+            const geo = new THREE.ExtrudeGeometry(shape, { depth: h, bevelEnabled: false, curveSegments: 1 });
+            geo.rotateX(-Math.PI/2);
+            addMesh(geo, boxOffsetX, y, 0);
+        }
     }
 
     // 4. RAILS
@@ -713,19 +804,19 @@ export default function App() {
         
         if (type === 'step') {
             const plate = new THREE.BoxGeometry(outerW, thickness, outerD);
-            addMesh(plate, lidX, thickness/2, 0, 0, lidMaterial);
+            addMesh(plate, lidX, thickness/2, 0, 0, 0, lidMaterial);
             if (insertDepth > 0) {
                 const innerW = outerW - (wall*2) - (config.tolerance || 0.01);
                 const innerD = outerD - (wall*2) - (config.tolerance || 0.01);
                 const insert = new THREE.BoxGeometry(innerW, insertDepth, innerD);
-                addMesh(insert, lidX, thickness + insertDepth/2, 0, 0, lidMaterial);
+                addMesh(insert, lidX, thickness + insertDepth/2, 0, 0, 0, lidMaterial);
             }
         } 
         else if (type === 'slide') {
             const plate = new THREE.BoxGeometry(width, thickness, depth);
-            addMesh(plate, lidX, thickness/2, 0, 0, lidMaterial);
+            addMesh(plate, lidX, thickness/2, 0, 0, 0, lidMaterial);
             const hGeo = new THREE.BoxGeometry(outerW * 0.2, thickness * 2, thickness);
-            addMesh(hGeo, lidX, thickness * 1.5, depth/2 - thickness, 0, lidMaterial);
+            addMesh(hGeo, lidX, thickness * 1.5, depth/2 - thickness, 0, 0, lidMaterial);
         }
     }
 
@@ -882,7 +973,7 @@ export default function App() {
                     <SegmentedControl options={[ { label: 'Internal Capacity', value: 'internal' }, { label: 'External Bounds', value: 'external' } ]} value={config.measureMode} onChange={v => updateConfig('measureMode', v)} />
                 )}
                 {appMode === 'gridfinity' && (
-                    <SegmentedControl options={[ { label: 'Bin (Male)', value: 'bin' }, { label: 'Frame (Fem)', value: 'frame' } ]} value={config.gridfinityType} onChange={v => updateConfig('gridfinityType', v)} />
+                    <SegmentedControl options={[ { label: 'Bin', value: 'bin' }, { label: 'Frame', value: 'frame' } ]} value={config.gridfinityType} onChange={v => updateConfig('gridfinityType', v)} />
                 )}
                 {appMode === 'gridfinity' ? (
                     <>
@@ -903,9 +994,20 @@ export default function App() {
                 <div className="mb-6 space-y-4 pt-4 border-t border-gray-700">
                     <ControlInput label="Wall Thickness" description="Structural walls" {...getStructProps('wall', 0.03, 0.5, 0.001)} />
                     <ControlInput label="Floor Thickness" description="Bottom plate" {...getStructProps('floor', 0.03, 0.5, 0.001)} />
+                    
+                    <div className="pt-2 pb-2">
+                        <label className="flex items-center justify-between cursor-pointer mb-3">
+                            <span className="text-xs font-bold text-gray-300">Wall Pattern</span>
+                            <input type="checkbox" checked={config.holes} onChange={e => updateConfig('holes', e.target.checked)} className="accent-blue-600" />
+                        </label>
+                        {config.holes && (
+                            <ControlInput label="Hex Hole Size" description="Diameter" {...getDisplayProps('holeSize', 0.1, 2.0, 0.01)} />
+                        )}
+                    </div>
+
                     {!isGridfinity && (
-                        <div className="pt-2">
-                            <label className="flex items-center cursor-pointer mb-3"><input type="checkbox" checked={config.lidEnabled} onChange={e => updateConfig('lidEnabled', e.target.checked)} className="mr-2 accent-blue-500" /><span className="text-sm font-bold text-white">Enable Lid</span></label>
+                        <div className="pt-2 border-t border-gray-700">
+                            <label className="flex items-center cursor-pointer mb-3 mt-4"><input type="checkbox" checked={config.lidEnabled} onChange={e => updateConfig('lidEnabled', e.target.checked)} className="mr-2 accent-blue-600" /><span className="text-sm font-bold text-white">Enable Lid</span></label>
                             {config.lidEnabled && (
                                 <>
                                     <SegmentedControl options={[ { label: 'Step (Friction)', value: 'step' }, { label: 'Slide (Rail)', value: 'slide' } ]} value={config.lidType} onChange={v => updateConfig('lidType', v)} />
