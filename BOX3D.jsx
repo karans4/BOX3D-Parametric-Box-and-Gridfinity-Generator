@@ -101,6 +101,9 @@ function generateRoundedRectRing(width, depth, radius, cornerSegs = 8) {
 // Build a BufferGeometry from stacked rounded-rect rings
 function buildProfileGeometry(levels, cornerSegs = 8, bottomHoles = null) {
     // levels: [{ y (scene units), width, depth, radius }]
+    // bottomHoles: [{ x, z, radius, depth?, screwRadius? }]
+    //   depth: magnet pocket depth (tube walls + annular floor)
+    //   screwRadius: concentric through-hole radius
     const rings = levels.map(l =>
         generateRoundedRectRing(l.width, l.depth, l.radius, cornerSegs).map(p => ({ ...p, y: l.y }))
     );
@@ -108,6 +111,7 @@ function buildProfileGeometry(levels, cornerSegs = 8, bottomHoles = null) {
     const ptsPerRing = rings[0].length;
     const vertices = [];
     const indices = [];
+    const HOLE_SEGS = 20;
 
     // Side faces between adjacent rings
     for (let r = 0; r < rings.length - 1; r++) {
@@ -131,25 +135,55 @@ function buildProfileGeometry(levels, cornerSegs = 8, bottomHoles = null) {
         }
     }
 
-    // Top cap (fan from center)
+    const botY = rings[0][0].y;
+    const topY = rings[rings.length - 1][0].y;
+
+    // Top cap with screw hole cutouts
     const topRing = rings[rings.length - 1];
-    const topCenterIdx = vertices.length / 3;
-    const topY = topRing[0].y;
-    vertices.push(0, topY, 0); // center
-    const topBaseIdx = vertices.length / 3;
-    for (let i = 0; i < ptsPerRing; i++) {
-        vertices.push(topRing[i].x, topRing[i].y, topRing[i].z);
-    }
-    for (let i = 0; i < ptsPerRing; i++) {
-        const next = (i + 1) % ptsPerRing;
-        indices.push(topCenterIdx, topBaseIdx + i, topBaseIdx + next);
+    if (bottomHoles && bottomHoles.some(h => h.screwRadius)) {
+        const topShape = createRoundedRectPath(
+            levels[levels.length - 1].width,
+            levels[levels.length - 1].depth,
+            levels[levels.length - 1].radius
+        );
+        for (const hole of bottomHoles) {
+            if (hole.screwRadius) {
+                const hp = new THREE.Path();
+                hp.absarc(hole.x, -hole.z, hole.screwRadius, 0, Math.PI * 2, true);
+                topShape.holes.push(hp);
+            }
+        }
+        const topGeo = new THREE.ShapeGeometry(topShape, cornerSegs * 4);
+        const pos = topGeo.attributes.position;
+        const idx = topGeo.index ? topGeo.index.array : null;
+        const capBase = vertices.length / 3;
+        for (let i = 0; i < pos.count; i++) {
+            vertices.push(pos.getX(i), topY, -pos.getY(i));
+        }
+        if (idx) {
+            for (let i = 0; i < idx.length; i += 3) {
+                indices.push(capBase + idx[i], capBase + idx[i + 1], capBase + idx[i + 2]);
+            }
+        }
+        topGeo.dispose();
+    } else {
+        // Simple top cap (fan from center)
+        const topCenterIdx = vertices.length / 3;
+        vertices.push(0, topY, 0);
+        const topBaseIdx = vertices.length / 3;
+        for (let i = 0; i < ptsPerRing; i++) {
+            vertices.push(topRing[i].x, topRing[i].y, topRing[i].z);
+        }
+        for (let i = 0; i < ptsPerRing; i++) {
+            const next = (i + 1) % ptsPerRing;
+            indices.push(topCenterIdx, topBaseIdx + i, topBaseIdx + next);
+        }
     }
 
-    // Bottom cap (fan from center, reversed winding)
+    // Bottom cap
     if (!bottomHoles || bottomHoles.length === 0) {
         const botRing = rings[0];
         const botCenterIdx = vertices.length / 3;
-        const botY = botRing[0].y;
         vertices.push(0, botY, 0);
         const botBaseIdx = vertices.length / 3;
         for (let i = 0; i < ptsPerRing; i++) {
@@ -160,33 +194,107 @@ function buildProfileGeometry(levels, cornerSegs = 8, bottomHoles = null) {
             indices.push(botCenterIdx, botBaseIdx + next, botBaseIdx + i);
         }
     } else {
-        // Bottom with holes - create a shape and use ExtrudeGeometry for the bottom face
-        const botRing = rings[0];
+        // Bottom face with magnet hole cutouts
         const botLevel = levels[0];
-        const botY = botRing[0].y;
         const shape = createRoundedRectPath(botLevel.width, botLevel.depth, botLevel.radius);
         for (const hole of bottomHoles) {
             const holePath = new THREE.Path();
-            holePath.absarc(hole.x, hole.z, hole.radius, 0, Math.PI * 2, true);
+            holePath.absarc(hole.x, -hole.z, hole.radius, 0, Math.PI * 2, true);
             shape.holes.push(holePath);
         }
-        // Triangulate the shape for the bottom cap
-        const shapePoints = shape.getPoints(cornerSegs * 4);
-        const holePointArrays = shape.holes.map(h => h.getPoints(16));
         const shapeGeo = new THREE.ShapeGeometry(shape, cornerSegs * 4);
         const pos = shapeGeo.attributes.position;
         const idx = shapeGeo.index ? shapeGeo.index.array : null;
         const capBaseIdx = vertices.length / 3;
         for (let i = 0; i < pos.count; i++) {
-            vertices.push(pos.getX(i), botY, -pos.getY(i)); // shape is XY, we want XZ (flip Y→Z)
+            vertices.push(pos.getX(i), botY, -pos.getY(i));
         }
         if (idx) {
             for (let i = 0; i < idx.length; i += 3) {
-                // Reverse winding for bottom face
                 indices.push(capBaseIdx + idx[i], capBaseIdx + idx[i + 2], capBaseIdx + idx[i + 1]);
             }
         }
         shapeGeo.dispose();
+
+        // For each hole: build tube walls + annular floor + screw through-tube
+        for (const hole of bottomHoles) {
+            const { x, z, radius, depth, screwRadius } = hole;
+
+            if (depth) {
+                // Magnet pocket tube walls (normals face inward)
+                const tubeBot = vertices.length / 3;
+                for (let i = 0; i < HOLE_SEGS; i++) {
+                    const a = (i / HOLE_SEGS) * Math.PI * 2;
+                    vertices.push(x + Math.cos(a) * radius, botY, z + Math.sin(a) * radius);
+                }
+                for (let i = 0; i < HOLE_SEGS; i++) {
+                    const a = (i / HOLE_SEGS) * Math.PI * 2;
+                    vertices.push(x + Math.cos(a) * radius, botY + depth, z + Math.sin(a) * radius);
+                }
+                for (let i = 0; i < HOLE_SEGS; i++) {
+                    const next = (i + 1) % HOLE_SEGS;
+                    const a = tubeBot + i, b = tubeBot + next;
+                    const c = tubeBot + HOLE_SEGS + next, d = tubeBot + HOLE_SEGS + i;
+                    // Reversed winding for inward-facing normals
+                    indices.push(a, c, b);
+                    indices.push(a, d, c);
+                }
+
+                // Annular floor at pocket depth (magnet radius → screw radius or center)
+                const innerR = screwRadius || 0;
+                const ringBase = vertices.length / 3;
+                const floorY = botY + depth;
+                // Outer ring
+                for (let i = 0; i < HOLE_SEGS; i++) {
+                    const a = (i / HOLE_SEGS) * Math.PI * 2;
+                    vertices.push(x + Math.cos(a) * radius, floorY, z + Math.sin(a) * radius);
+                }
+                if (innerR > 0) {
+                    // Inner ring (screw hole edge)
+                    for (let i = 0; i < HOLE_SEGS; i++) {
+                        const a = (i / HOLE_SEGS) * Math.PI * 2;
+                        vertices.push(x + Math.cos(a) * innerR, floorY, z + Math.sin(a) * innerR);
+                    }
+                    // Triangulate annulus (faces up, visible from below through the hole)
+                    for (let i = 0; i < HOLE_SEGS; i++) {
+                        const next = (i + 1) % HOLE_SEGS;
+                        const o0 = ringBase + i, o1 = ringBase + next;
+                        const i0 = ringBase + HOLE_SEGS + i, i1 = ringBase + HOLE_SEGS + next;
+                        indices.push(o0, o1, i1);
+                        indices.push(o0, i1, i0);
+                    }
+                } else {
+                    // Solid circle cap (fan)
+                    const centerIdx = vertices.length / 3;
+                    vertices.push(x, floorY, z);
+                    for (let i = 0; i < HOLE_SEGS; i++) {
+                        const next = (i + 1) % HOLE_SEGS;
+                        indices.push(centerIdx, ringBase + next, ringBase + i);
+                    }
+                }
+            }
+
+            // Screw through-hole: same as magnet hole but from pocket floor to top
+            if (screwRadius && depth) {
+                const screwBotY = botY + depth; // starts at magnet pocket floor
+                const screwBot = vertices.length / 3;
+                for (let i = 0; i < HOLE_SEGS; i++) {
+                    const a = (i / HOLE_SEGS) * Math.PI * 2;
+                    vertices.push(x + Math.cos(a) * screwRadius, screwBotY, z + Math.sin(a) * screwRadius);
+                }
+                for (let i = 0; i < HOLE_SEGS; i++) {
+                    const a = (i / HOLE_SEGS) * Math.PI * 2;
+                    vertices.push(x + Math.cos(a) * screwRadius, topY, z + Math.sin(a) * screwRadius);
+                }
+                for (let i = 0; i < HOLE_SEGS; i++) {
+                    const next = (i + 1) % HOLE_SEGS;
+                    const a = screwBot + i, b = screwBot + next;
+                    const c = screwBot + HOLE_SEGS + next, d = screwBot + HOLE_SEGS + i;
+                    indices.push(a, c, b);
+                    indices.push(a, d, c);
+                }
+            }
+        }
     }
 
     const geo = new THREE.BufferGeometry();
@@ -210,13 +318,15 @@ function createGridfinityFootGeo(withMagnets = true) {
 
     let holes = null;
     if (withMagnets) {
-        const magR = (6.0 / 2) * MM_TO_IN; // 6mm diameter magnets (standard)
+        const magR = (6.5 / 2) * MM_TO_IN;   // 6mm magnet + 0.5mm clearance
+        const magD = 2.4 * MM_TO_IN;          // magnet pocket depth
+        const screwR = (2.9 / 2) * MM_TO_IN;  // 2.4mm screw + 0.5mm clearance
         const magOff = 13.0 * MM_TO_IN;
         holes = [
-            { x: -magOff, z: -magOff, radius: magR },
-            { x: magOff, z: -magOff, radius: magR },
-            { x: -magOff, z: magOff, radius: magR },
-            { x: magOff, z: magOff, radius: magR },
+            { x: -magOff, z: -magOff, radius: magR, depth: magD, screwRadius: screwR },
+            { x: magOff, z: -magOff, radius: magR, depth: magD, screwRadius: screwR },
+            { x: -magOff, z: magOff, radius: magR, depth: magD, screwRadius: screwR },
+            { x: magOff, z: magOff, radius: magR, depth: magD, screwRadius: screwR },
         ];
     }
 
@@ -359,9 +469,10 @@ function calculateConstraints(config) {
     let outerW_IU = 0, outerD_IU = 0;
     let innerW_IU = 0, innerD_IU = 0;
 
+    const gridTolerance_IU = 0.5 * IU_PER_MM; // 0.5mm total shrink for bin-to-bin clearance
     if (isGridfinity) {
-        outerW_IU = gridWidth * grid42_IU;
-        outerD_IU = gridDepth * grid42_IU;
+        outerW_IU = gridWidth * grid42_IU - gridTolerance_IU;
+        outerD_IU = gridDepth * grid42_IU - gridTolerance_IU;
         innerW_IU = outerW_IU - (wall_IU * 2);
         innerD_IU = outerD_IU - (wall_IU * 2);
     } else if (measureMode === 'internal') {
@@ -662,36 +773,30 @@ function ControlInput({ label, value, min, max, step, onChange, unitLabel, error
 }
 
 // --- Compartment Editor (Birds-Eye Wall Placement) ---
+// Wall data model: { axis: 'x'|'z', pos: <mm>, seg: <index> }
+// axis='x': vertical wall at x=pos, segment seg (0..gridDepth-1) spans one cell in z
+// axis='z': horizontal wall at z=pos, segment seg (0..gridWidth-1) spans one cell in x
 function CompartmentEditor({ gridWidth, gridDepth, walls, onWallsChange }) {
     const svgRef = useRef(null);
-    const [hover, setHover] = useState(null); // { axis, pos }
+    const [hover, setHover] = useState(null); // { axis, pos, seg }
 
     const CELL_MM = 42;
     const totalW = gridWidth * CELL_MM;
     const totalD = gridDepth * CELL_MM;
 
-    // SVG sizing: fit within ~240px width, maintain aspect ratio
     const maxPx = 220;
     const scale = maxPx / Math.max(totalW, totalD);
     const svgW = totalW * scale;
     const svgH = totalD * scale;
 
-    // Snap resolution: walls can be placed at half-unit intervals (21mm)
-    const SNAP = 21; // mm
+    const wallExists = (axis, pos, seg) =>
+        walls.some(w => w.axis === axis && w.pos === pos && w.seg === seg);
 
-    // Generate valid wall positions (interior only, not on outer edges)
-    const xPositions = [];
-    for (let x = SNAP; x < totalW; x += SNAP) xPositions.push(x);
-    const zPositions = [];
-    for (let z = SNAP; z < totalD; z += SNAP) zPositions.push(z);
-
-    const wallExists = (axis, pos) => walls.some(w => w.axis === axis && w.pos === pos);
-
-    const toggleWall = (axis, pos) => {
-        if (wallExists(axis, pos)) {
-            onWallsChange(walls.filter(w => !(w.axis === axis && w.pos === pos)));
+    const toggleWall = (axis, pos, seg) => {
+        if (wallExists(axis, pos, seg)) {
+            onWallsChange(walls.filter(w => !(w.axis === axis && w.pos === pos && w.seg === seg)));
         } else {
-            onWallsChange([...walls, { axis, pos }]);
+            onWallsChange([...walls, { axis, pos, seg }]);
         }
     };
 
@@ -702,31 +807,43 @@ function CompartmentEditor({ gridWidth, gridDepth, walls, onWallsChange }) {
         const mx = ((e.clientX - rect.left) / rect.width) * totalW;
         const mz = ((e.clientY - rect.top) / rect.height) * totalD;
 
-        // Find closest snap line
         let best = null;
         let bestDist = Infinity;
 
-        // Check vertical lines (x-axis walls — dividers running along Z)
-        for (const x of xPositions) {
+        // Check vertical lines (x-axis walls)
+        for (let xi = 1; xi < gridWidth; xi++) {
+            const x = xi * CELL_MM;
             const d = Math.abs(mx - x);
-            if (d < bestDist && d < SNAP * 0.4) {
+            if (d < bestDist && d < CELL_MM * 0.4) {
+                const seg = Math.max(0, Math.min(gridDepth - 1, Math.floor(mz / CELL_MM)));
                 bestDist = d;
-                best = { axis: 'x', pos: x };
+                best = { axis: 'x', pos: x, seg };
             }
         }
-        // Check horizontal lines (z-axis walls — dividers running along X)
-        for (const z of zPositions) {
+        // Check horizontal lines (z-axis walls)
+        for (let zi = 1; zi < gridDepth; zi++) {
+            const z = zi * CELL_MM;
             const d = Math.abs(mz - z);
-            if (d < bestDist && d < SNAP * 0.4) {
+            if (d < bestDist && d < CELL_MM * 0.4) {
+                const seg = Math.max(0, Math.min(gridWidth - 1, Math.floor(mx / CELL_MM)));
                 bestDist = d;
-                best = { axis: 'z', pos: z };
+                best = { axis: 'z', pos: z, seg };
             }
         }
         setHover(best);
     };
 
     const handleClick = () => {
-        if (hover) toggleWall(hover.axis, hover.pos);
+        if (hover) toggleWall(hover.axis, hover.pos, hover.seg);
+    };
+
+    // Helper: get line coords for a wall segment
+    const segCoords = (w) => {
+        if (w.axis === 'x') {
+            return { x1: w.pos, y1: w.seg * CELL_MM, x2: w.pos, y2: (w.seg + 1) * CELL_MM };
+        } else {
+            return { x1: w.seg * CELL_MM, y1: w.pos, x2: (w.seg + 1) * CELL_MM, y2: w.pos };
+        }
     };
 
     return (
@@ -753,30 +870,23 @@ function CompartmentEditor({ gridWidth, gridDepth, walls, onWallsChange }) {
                             stroke="#374151" strokeWidth={0.5} strokeDasharray="2,2" />
                     ))}
 
-                    {/* Placed walls */}
-                    {walls.map((w, i) => (
-                        w.axis === 'x'
-                            ? <line key={`w${i}`} x1={w.pos} y1={0} x2={w.pos} y2={totalD}
-                                stroke="#60a5fa" strokeWidth={1.5} />
-                            : <line key={`w${i}`} x1={0} y1={w.pos} x2={totalW} y2={w.pos}
-                                stroke="#60a5fa" strokeWidth={1.5} />
-                    ))}
+                    {/* Placed wall segments */}
+                    {walls.map((w, i) => {
+                        const c = segCoords(w);
+                        return <line key={`w${i}`} x1={c.x1} y1={c.y1} x2={c.x2} y2={c.y2}
+                            stroke="#60a5fa" strokeWidth={1.5} />;
+                    })}
 
                     {/* Hover preview */}
-                    {hover && !wallExists(hover.axis, hover.pos) && (
-                        hover.axis === 'x'
-                            ? <line x1={hover.pos} y1={0} x2={hover.pos} y2={totalD}
-                                stroke="#3b82f6" strokeWidth={1} opacity={0.5} strokeDasharray="3,2" />
-                            : <line x1={0} y1={hover.pos} x2={totalW} y2={hover.pos}
-                                stroke="#3b82f6" strokeWidth={1} opacity={0.5} strokeDasharray="3,2" />
-                    )}
-                    {hover && wallExists(hover.axis, hover.pos) && (
-                        hover.axis === 'x'
-                            ? <line x1={hover.pos} y1={0} x2={hover.pos} y2={totalD}
-                                stroke="#ef4444" strokeWidth={2} opacity={0.6} />
-                            : <line x1={0} y1={hover.pos} x2={totalW} y2={hover.pos}
-                                stroke="#ef4444" strokeWidth={2} opacity={0.6} />
-                    )}
+                    {hover && (() => {
+                        const c = segCoords(hover);
+                        const exists = wallExists(hover.axis, hover.pos, hover.seg);
+                        return <line x1={c.x1} y1={c.y1} x2={c.x2} y2={c.y2}
+                            stroke={exists ? "#ef4444" : "#3b82f6"}
+                            strokeWidth={exists ? 2 : 1}
+                            opacity={exists ? 0.6 : 0.5}
+                            strokeDasharray={exists ? undefined : "3,2"} />;
+                    })()}
 
                     {/* Outer border */}
                     <rect x={0} y={0} width={totalW} height={totalD}
@@ -830,6 +940,18 @@ export default function App() {
       holes: false,
       infill: 0.50
   });
+
+  // Prune walls that are out of bounds when grid shrinks
+  useEffect(() => {
+      if (compartmentWalls.length === 0) return;
+      const maxX = config.gridWidth * 42;
+      const maxZ = config.gridDepth * 42;
+      const valid = compartmentWalls.filter(w => {
+          if (w.axis === 'x') return w.pos < maxX && w.seg < config.gridDepth;
+          else return w.pos < maxZ && w.seg < config.gridWidth;
+      });
+      if (valid.length !== compartmentWalls.length) setCompartmentWalls(valid);
+  }, [config.gridWidth, config.gridDepth]);
 
   const updateConfig = (key, value) => {
       if (typeof value === 'number') {
@@ -943,12 +1065,12 @@ export default function App() {
     dirLight.castShadow = true;
     scene.add(dirLight);
 
-    const bottomLight = new THREE.DirectionalLight(0xffffff, 0.8);
-    bottomLight.position.set(5, -10, 8);
+    const bottomLight = new THREE.DirectionalLight(0xffffff, 0.9);
+    bottomLight.position.set(12, -5, 15);
     scene.add(bottomLight);
 
-    const bottomLight2 = new THREE.DirectionalLight(0xffffff, 0.5);
-    bottomLight2.position.set(-8, -6, -5);
+    const bottomLight2 = new THREE.DirectionalLight(0xffffff, 0.6);
+    bottomLight2.position.set(-10, -4, -12);
     scene.add(bottomLight2);
     
     const gridHelper = new THREE.GridHelper(100, 100, 0x374151, 0x1f2937);
@@ -993,8 +1115,9 @@ export default function App() {
     const { outerW, outerD, stack } = layout;
     const { wall, holes, holeSize, gridfinityType, lidEnabled, lidType, infill } = config;
 
-    const material = new THREE.MeshStandardMaterial({ 
-        color: "#3b82f6", roughness: 0.5, metalness: 0.1
+    const material = new THREE.MeshStandardMaterial({
+        color: "#3b82f6", roughness: 0.5, metalness: 0.1,
+        side: THREE.DoubleSide
     });
     const lidMaterial = new THREE.MeshStandardMaterial({ 
         color: "#3b82f6", roughness: 0.5, metalness: 0.1
@@ -1068,8 +1191,11 @@ export default function App() {
         const GRID_IN = 42.0 * MM_TO_IN;
         const footGeo = createGridfinityFootGeo(true);
 
-        const startX = -(outerW / 2) + (GRID_IN / 2);
-        const startZ = -(outerD / 2) + (GRID_IN / 2);
+        // Feet on nominal 42mm grid centers (independent of 0.5mm outer shrink)
+        const nominalW = unitsX * GRID_IN;
+        const nominalD = unitsZ * GRID_IN;
+        const startX = -(nominalW / 2) + (GRID_IN / 2);
+        const startZ = -(nominalD / 2) + (GRID_IN / 2);
 
         for (let i = 0; i < unitsX; i++) {
             for (let j = 0; j < unitsZ; j++) {
@@ -1103,7 +1229,7 @@ export default function App() {
                 shape.lineTo(-w/2, height);
                 shape.lineTo(-w/2, 0);
 
-                const hexR = toScene(config.holeSize) / 2;
+                const hexR = toScene(config.holeSize) / 2 + (0.5 / 2) * MM_TO_IN; // +0.5mm clearance
                 const voidFraction = 1 - Math.min(0.99, Math.max(0.01, infill));
                 const centerSpacing = hexR * Math.sqrt(3 / voidFraction);
                 const spacingX = centerSpacing;
@@ -1171,6 +1297,32 @@ export default function App() {
         }
     }
 
+    // 3.5. COMPARTMENT DIVIDERS (per-segment)
+    if (stack.wall && compartmentWalls.length > 0) {
+        const h = stack.wall.yMax - stack.wall.yMin + GEO_OVERLAP;
+        const y = stack.wall.yMin - GEO_OVERLAP;
+        const wallThick = toScene(config.wall);
+        const GRID_IN = 42.0 * MM_TO_IN;
+
+        for (const w of compartmentWalls) {
+            if (w.axis === 'x') {
+                // Vertical segment: spans one cell in Z
+                const segLen = GRID_IN; // one cell
+                const geo = new THREE.BoxGeometry(wallThick, h, segLen);
+                const wx = -(outerW / 2) + (w.pos * MM_TO_IN);
+                const wz = -(outerD / 2) + (w.seg + 0.5) * GRID_IN;
+                addMesh(geo, boxOffsetX + wx, y + h / 2, wz);
+            } else {
+                // Horizontal segment: spans one cell in X
+                const segLen = GRID_IN;
+                const geo = new THREE.BoxGeometry(segLen, h, wallThick);
+                const wz = -(outerD / 2) + (w.pos * MM_TO_IN);
+                const wx = -(outerW / 2) + (w.seg + 0.5) * GRID_IN;
+                addMesh(geo, boxOffsetX + wx, y + h / 2, wz);
+            }
+        }
+    }
+
     // 4. RAILS
     if (stack.rail) {
         const { spacer, cap } = stack.rail;
@@ -1228,7 +1380,7 @@ export default function App() {
         }
     }
 
-  }, [layout, config]);
+  }, [layout, config, compartmentWalls]);
 
   // --- DIMENSION LABELS ---
   useEffect(() => {
@@ -1420,14 +1572,14 @@ export default function App() {
             <h1 className="text-xl font-bold text-white mb-6">BOX3D -- <span className="text-blue-400">3D Printable Box & Gridfinity Generator</span></h1>
             
 
-            <SegmentedControl options={[ { label: 'Inch', value: 'in' }, { label: 'mm', value: 'mm' }, { label: 'Gridfinity', value: 'gridfinity' } ]} value={appMode} onChange={setAppMode} />
+            <SegmentedControl options={[ { label: 'Inch', value: 'in' }, { label: 'mm', value: 'mm' }, { label: 'Gridfinity', value: 'gridfinity' } ]} value={appMode} onChange={v => { setAppMode(v); if (v !== 'gridfinity') setCompartmentWalls([]); }} />
             
             <div className="mb-6 space-y-4">
                 {appMode !== 'gridfinity' && (
                     <SegmentedControl options={[ { label: 'Internal Capacity', value: 'internal' }, { label: 'External Bounds', value: 'external' } ]} value={config.measureMode} onChange={v => updateConfig('measureMode', v)} />
                 )}
                 {appMode === 'gridfinity' && (
-                    <SegmentedControl options={[ { label: 'Bin', value: 'bin' }, { label: 'Frame', value: 'frame' } ]} value={config.gridfinityType} onChange={v => updateConfig('gridfinityType', v)} />
+                    <SegmentedControl options={[ { label: 'Bin', value: 'bin' }, { label: 'Frame', value: 'frame' } ]} value={config.gridfinityType} onChange={v => { updateConfig('gridfinityType', v); if (v !== 'bin') setCompartmentWalls([]); }} />
                 )}
                 {appMode === 'gridfinity' ? (
                     <>
