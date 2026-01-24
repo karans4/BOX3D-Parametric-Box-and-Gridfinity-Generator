@@ -71,6 +71,246 @@ function createRoundedRectPath(width, height, radius) {
     return ctx;
 }
 
+// --- Gridfinity Geometry Helpers ---
+
+// Generate points around a rounded rectangle perimeter (in XZ plane)
+function generateRoundedRectRing(width, depth, radius, cornerSegs = 8) {
+    const points = [];
+    const hw = width / 2;
+    const hd = depth / 2;
+    const r = Math.min(radius, hw, hd);
+
+    // Corner centers (counterclockwise from bottom-right)
+    const corners = [
+        { cx: hw - r, cz: -(hd - r), a0: -Math.PI / 2, a1: 0 },           // bottom-right
+        { cx: hw - r, cz: hd - r, a0: 0, a1: Math.PI / 2 },               // top-right
+        { cx: -(hw - r), cz: hd - r, a0: Math.PI / 2, a1: Math.PI },      // top-left
+        { cx: -(hw - r), cz: -(hd - r), a0: Math.PI, a1: 3 * Math.PI / 2 }, // bottom-left
+    ];
+
+    for (const c of corners) {
+        for (let i = 0; i < cornerSegs; i++) {
+            const t = i / cornerSegs;
+            const angle = c.a0 + (c.a1 - c.a0) * t;
+            points.push({ x: c.cx + r * Math.cos(angle), z: c.cz + r * Math.sin(angle) });
+        }
+    }
+    return points;
+}
+
+// Build a BufferGeometry from stacked rounded-rect rings
+function buildProfileGeometry(levels, cornerSegs = 8, bottomHoles = null) {
+    // levels: [{ y (scene units), width, depth, radius }]
+    const rings = levels.map(l =>
+        generateRoundedRectRing(l.width, l.depth, l.radius, cornerSegs).map(p => ({ ...p, y: l.y }))
+    );
+
+    const ptsPerRing = rings[0].length;
+    const vertices = [];
+    const indices = [];
+
+    // Side faces between adjacent rings
+    for (let r = 0; r < rings.length - 1; r++) {
+        const baseIdx = vertices.length / 3;
+        const ring0 = rings[r];
+        const ring1 = rings[r + 1];
+        for (let i = 0; i < ptsPerRing; i++) {
+            vertices.push(ring0[i].x, ring0[i].y, ring0[i].z);
+        }
+        for (let i = 0; i < ptsPerRing; i++) {
+            vertices.push(ring1[i].x, ring1[i].y, ring1[i].z);
+        }
+        for (let i = 0; i < ptsPerRing; i++) {
+            const next = (i + 1) % ptsPerRing;
+            const a = baseIdx + i;
+            const b = baseIdx + next;
+            const c = baseIdx + ptsPerRing + next;
+            const d = baseIdx + ptsPerRing + i;
+            indices.push(a, b, c);
+            indices.push(a, c, d);
+        }
+    }
+
+    // Top cap (fan from center)
+    const topRing = rings[rings.length - 1];
+    const topCenterIdx = vertices.length / 3;
+    const topY = topRing[0].y;
+    vertices.push(0, topY, 0); // center
+    const topBaseIdx = vertices.length / 3;
+    for (let i = 0; i < ptsPerRing; i++) {
+        vertices.push(topRing[i].x, topRing[i].y, topRing[i].z);
+    }
+    for (let i = 0; i < ptsPerRing; i++) {
+        const next = (i + 1) % ptsPerRing;
+        indices.push(topCenterIdx, topBaseIdx + i, topBaseIdx + next);
+    }
+
+    // Bottom cap (fan from center, reversed winding)
+    if (!bottomHoles || bottomHoles.length === 0) {
+        const botRing = rings[0];
+        const botCenterIdx = vertices.length / 3;
+        const botY = botRing[0].y;
+        vertices.push(0, botY, 0);
+        const botBaseIdx = vertices.length / 3;
+        for (let i = 0; i < ptsPerRing; i++) {
+            vertices.push(botRing[i].x, botRing[i].y, botRing[i].z);
+        }
+        for (let i = 0; i < ptsPerRing; i++) {
+            const next = (i + 1) % ptsPerRing;
+            indices.push(botCenterIdx, botBaseIdx + next, botBaseIdx + i);
+        }
+    } else {
+        // Bottom with holes - create a shape and use ExtrudeGeometry for the bottom face
+        const botRing = rings[0];
+        const botLevel = levels[0];
+        const botY = botRing[0].y;
+        const shape = createRoundedRectPath(botLevel.width, botLevel.depth, botLevel.radius);
+        for (const hole of bottomHoles) {
+            const holePath = new THREE.Path();
+            holePath.absarc(hole.x, hole.z, hole.radius, 0, Math.PI * 2, true);
+            shape.holes.push(holePath);
+        }
+        // Triangulate the shape for the bottom cap
+        const shapePoints = shape.getPoints(cornerSegs * 4);
+        const holePointArrays = shape.holes.map(h => h.getPoints(16));
+        const shapeGeo = new THREE.ShapeGeometry(shape, cornerSegs * 4);
+        const pos = shapeGeo.attributes.position;
+        const idx = shapeGeo.index ? shapeGeo.index.array : null;
+        const capBaseIdx = vertices.length / 3;
+        for (let i = 0; i < pos.count; i++) {
+            vertices.push(pos.getX(i), botY, -pos.getY(i)); // shape is XY, we want XZ (flip Y→Z)
+        }
+        if (idx) {
+            for (let i = 0; i < idx.length; i += 3) {
+                // Reverse winding for bottom face
+                indices.push(capBaseIdx + idx[i], capBaseIdx + idx[i + 2], capBaseIdx + idx[i + 1]);
+            }
+        }
+        shapeGeo.dispose();
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+    geo.setIndex(indices);
+    geo.computeVertexNormals();
+    return geo;
+}
+
+// Create a single Gridfinity foot (one grid cell)
+function createGridfinityFootGeo(withMagnets = true) {
+    // Ground-truth profile (cq-gridfinity verified):
+    // 35.6mm base → 0.7mm 45° → 37.0mm → 1.8mm vert → 2.25mm 45° → 41.5mm top
+    // Total height: 4.75mm. Outer fillet: 4.0mm at top.
+    const levels = [
+        { y: 0,                          width: 35.6 * MM_TO_IN, depth: 35.6 * MM_TO_IN, radius: 1.05 * MM_TO_IN },
+        { y: 0.7 * MM_TO_IN,            width: 37.0 * MM_TO_IN, depth: 37.0 * MM_TO_IN, radius: 1.75 * MM_TO_IN },
+        { y: (0.7 + 1.8) * MM_TO_IN,    width: 37.0 * MM_TO_IN, depth: 37.0 * MM_TO_IN, radius: 1.75 * MM_TO_IN },
+        { y: (0.7 + 1.8 + 2.25) * MM_TO_IN, width: 41.5 * MM_TO_IN, depth: 41.5 * MM_TO_IN, radius: 4.0 * MM_TO_IN },
+    ];
+
+    let holes = null;
+    if (withMagnets) {
+        const magR = (6.0 / 2) * MM_TO_IN; // 6mm diameter magnets (standard)
+        const magOff = 13.0 * MM_TO_IN;
+        holes = [
+            { x: -magOff, z: -magOff, radius: magR },
+            { x: magOff, z: -magOff, radius: magR },
+            { x: -magOff, z: magOff, radius: magR },
+            { x: magOff, z: magOff, radius: magR },
+        ];
+    }
+
+    return buildProfileGeometry(levels, 8, holes);
+}
+
+// Create the stacking lip geometry (inverted foot profile around bin perimeter)
+// The lip is a rim at the top of the bin. Its inner cavity receives the foot of a stacking bin.
+// Inner profile mirrors the foot: widest at top (entrance, 41.5mm per unit), narrowest at bottom (seat, 35.6mm per unit).
+function createGridfinityLipGeo(outerW, outerD) {
+    const lipH = 4.4 * MM_TO_IN; // 4.4mm lip (0.35mm clearance vs 4.75mm foot)
+
+    // Insets from outer wall to inner lip surface (per axis total, both sides)
+    // Lip cavity mirrors foot profile: same 45° chamfers (0.7mm, 2.25mm)
+    const insetTop = 0.5 * MM_TO_IN;       // 0.25mm per side — thin edge at entrance
+    const insetMid = 5.0 * MM_TO_IN;       // after 2.25mm 45° chamfer (0.25 + 2.25 per side)
+    const insetBot = 6.4 * MM_TO_IN;       // after 0.7mm 45° chamfer (0.25 + 2.25 + 0.7 per side)
+
+    // Vertical section: 4.4 - 2.25 - 0.7 = 1.45mm (shorter than foot's 1.8mm — the clearance)
+    const innerLevels = [
+        { y: 0,                              width: outerW - insetBot, depth: outerD - insetBot, radius: 1.05 * MM_TO_IN },
+        { y: 0.7 * MM_TO_IN,                width: outerW - insetMid, depth: outerD - insetMid, radius: 1.75 * MM_TO_IN },
+        { y: (0.7 + 1.45) * MM_TO_IN,       width: outerW - insetMid, depth: outerD - insetMid, radius: 1.75 * MM_TO_IN },
+        { y: lipH,                           width: outerW - insetTop, depth: outerD - insetTop, radius: 4.0 * MM_TO_IN },
+    ];
+
+    const cornerSegs = 8;
+    const ptsPerRing = cornerSegs * 4;
+    const vertices = [];
+    const indices = [];
+
+    // Outer wall: straight vertical extrusion of the bin outer rect
+    const outerRing = generateRoundedRectRing(outerW, outerD, 4.0 * MM_TO_IN, cornerSegs);
+
+    // Outer sides
+    const outerBotIdx = 0;
+    for (let i = 0; i < ptsPerRing; i++) vertices.push(outerRing[i].x, 0, outerRing[i].z);
+    for (let i = 0; i < ptsPerRing; i++) vertices.push(outerRing[i].x, lipH, outerRing[i].z);
+    for (let i = 0; i < ptsPerRing; i++) {
+        const next = (i + 1) % ptsPerRing;
+        const a = outerBotIdx + i, b = outerBotIdx + next;
+        const c = outerBotIdx + ptsPerRing + next, d = outerBotIdx + ptsPerRing + i;
+        indices.push(a, c, b);
+        indices.push(a, d, c);
+    }
+
+    // Inner sides (stepped profile, faces inward)
+    const innerRings = innerLevels.map(l =>
+        generateRoundedRectRing(l.width, l.depth, l.radius, cornerSegs).map(p => ({ ...p, y: l.y }))
+    );
+    for (let r = 0; r < innerRings.length - 1; r++) {
+        const baseIdx = vertices.length / 3;
+        const ring0 = innerRings[r], ring1 = innerRings[r + 1];
+        for (let i = 0; i < ptsPerRing; i++) vertices.push(ring0[i].x, ring0[i].y, ring0[i].z);
+        for (let i = 0; i < ptsPerRing; i++) vertices.push(ring1[i].x, ring1[i].y, ring1[i].z);
+        for (let i = 0; i < ptsPerRing; i++) {
+            const next = (i + 1) % ptsPerRing;
+            const a = baseIdx + i, b = baseIdx + next;
+            const c = baseIdx + ptsPerRing + next, d = baseIdx + ptsPerRing + i;
+            indices.push(a, b, c);
+            indices.push(a, c, d);
+        }
+    }
+
+    // Bottom annular cap (between outer ring at y=0 and inner ring at y=0)
+    const botOBase = vertices.length / 3;
+    for (let i = 0; i < ptsPerRing; i++) vertices.push(outerRing[i].x, 0, outerRing[i].z);
+    const botIBase = vertices.length / 3;
+    for (let i = 0; i < ptsPerRing; i++) vertices.push(innerRings[0][i].x, 0, innerRings[0][i].z);
+    for (let i = 0; i < ptsPerRing; i++) {
+        const next = (i + 1) % ptsPerRing;
+        indices.push(botOBase + i, botIBase + i, botIBase + next);
+        indices.push(botOBase + i, botIBase + next, botOBase + next);
+    }
+
+    // Top annular cap (between outer ring at y=lipH and inner ring at y=lipH)
+    const topOBase = vertices.length / 3;
+    for (let i = 0; i < ptsPerRing; i++) vertices.push(outerRing[i].x, lipH, outerRing[i].z);
+    const topIBase = vertices.length / 3;
+    const topInner = innerRings[innerRings.length - 1];
+    for (let i = 0; i < ptsPerRing; i++) vertices.push(topInner[i].x, lipH, topInner[i].z);
+    for (let i = 0; i < ptsPerRing; i++) {
+        const next = (i + 1) % ptsPerRing;
+        indices.push(topOBase + i, topOBase + next, topIBase + next);
+        indices.push(topOBase + i, topIBase + next, topIBase + i);
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+    geo.setIndex(indices);
+    geo.computeVertexNormals();
+    return geo;
+}
+
 // --- Constraint Engine ---
 function calculateConstraints(config) {
     const { 
@@ -95,7 +335,7 @@ function calculateConstraints(config) {
     // Constants in IU
     const grid42_IU = 42 * IU_PER_MM;
     const grid7_IU = 7 * IU_PER_MM;
-    const lipHeight_IU = 440000; // 4.4mm * 100k
+    const lipHeight_IU = 440000; // 4.4mm — stacking lip (0.35mm clearance vs 4.75mm foot)
     const railCapH_IU = 200000;  // 2.0mm * 100k
     
     // --- VALIDATION CHECKS (Mapped to Controls) ---
@@ -156,9 +396,9 @@ function calculateConstraints(config) {
     
     // A. Feet
     if (isGridfinity && gridfinityType === 'bin') {
-        const footH_IU = 500000; // 5mm
+        const footH_IU = 475000; // 4.75mm (0.7 + 1.8 + 2.25)
         stack.feet = { yMin: 0, yMax: toScene(footH_IU) };
-        cursorY_IU = footH_IU; 
+        cursorY_IU = footH_IU;
     }
 
     // B. Floor
@@ -421,6 +661,139 @@ function ControlInput({ label, value, min, max, step, onChange, unitLabel, error
     );
 }
 
+// --- Compartment Editor (Birds-Eye Wall Placement) ---
+function CompartmentEditor({ gridWidth, gridDepth, walls, onWallsChange }) {
+    const svgRef = useRef(null);
+    const [hover, setHover] = useState(null); // { axis, pos }
+
+    const CELL_MM = 42;
+    const totalW = gridWidth * CELL_MM;
+    const totalD = gridDepth * CELL_MM;
+
+    // SVG sizing: fit within ~240px width, maintain aspect ratio
+    const maxPx = 220;
+    const scale = maxPx / Math.max(totalW, totalD);
+    const svgW = totalW * scale;
+    const svgH = totalD * scale;
+
+    // Snap resolution: walls can be placed at half-unit intervals (21mm)
+    const SNAP = 21; // mm
+
+    // Generate valid wall positions (interior only, not on outer edges)
+    const xPositions = [];
+    for (let x = SNAP; x < totalW; x += SNAP) xPositions.push(x);
+    const zPositions = [];
+    for (let z = SNAP; z < totalD; z += SNAP) zPositions.push(z);
+
+    const wallExists = (axis, pos) => walls.some(w => w.axis === axis && w.pos === pos);
+
+    const toggleWall = (axis, pos) => {
+        if (wallExists(axis, pos)) {
+            onWallsChange(walls.filter(w => !(w.axis === axis && w.pos === pos)));
+        } else {
+            onWallsChange([...walls, { axis, pos }]);
+        }
+    };
+
+    const handleMouseMove = (e) => {
+        const svg = svgRef.current;
+        if (!svg) return;
+        const rect = svg.getBoundingClientRect();
+        const mx = ((e.clientX - rect.left) / rect.width) * totalW;
+        const mz = ((e.clientY - rect.top) / rect.height) * totalD;
+
+        // Find closest snap line
+        let best = null;
+        let bestDist = Infinity;
+
+        // Check vertical lines (x-axis walls — dividers running along Z)
+        for (const x of xPositions) {
+            const d = Math.abs(mx - x);
+            if (d < bestDist && d < SNAP * 0.4) {
+                bestDist = d;
+                best = { axis: 'x', pos: x };
+            }
+        }
+        // Check horizontal lines (z-axis walls — dividers running along X)
+        for (const z of zPositions) {
+            const d = Math.abs(mz - z);
+            if (d < bestDist && d < SNAP * 0.4) {
+                bestDist = d;
+                best = { axis: 'z', pos: z };
+            }
+        }
+        setHover(best);
+    };
+
+    const handleClick = () => {
+        if (hover) toggleWall(hover.axis, hover.pos);
+    };
+
+    return (
+        <div className="mb-4">
+            <span className="text-xs font-bold text-gray-300 block mb-2">Compartments</span>
+            <div className="flex justify-center">
+                <svg
+                    ref={svgRef}
+                    width={svgW}
+                    height={svgH}
+                    className="bg-gray-900 border border-gray-600 rounded cursor-crosshair"
+                    onMouseMove={handleMouseMove}
+                    onMouseLeave={() => setHover(null)}
+                    onClick={handleClick}
+                    viewBox={`0 0 ${totalW} ${totalD}`}
+                >
+                    {/* Grid unit lines (dashed) */}
+                    {Array.from({ length: gridWidth - 1 }, (_, i) => (i + 1) * CELL_MM).map(x => (
+                        <line key={`gx${x}`} x1={x} y1={0} x2={x} y2={totalD}
+                            stroke="#374151" strokeWidth={0.5} strokeDasharray="2,2" />
+                    ))}
+                    {Array.from({ length: gridDepth - 1 }, (_, i) => (i + 1) * CELL_MM).map(z => (
+                        <line key={`gz${z}`} x1={0} y1={z} x2={totalW} y2={z}
+                            stroke="#374151" strokeWidth={0.5} strokeDasharray="2,2" />
+                    ))}
+
+                    {/* Placed walls */}
+                    {walls.map((w, i) => (
+                        w.axis === 'x'
+                            ? <line key={`w${i}`} x1={w.pos} y1={0} x2={w.pos} y2={totalD}
+                                stroke="#60a5fa" strokeWidth={1.5} />
+                            : <line key={`w${i}`} x1={0} y1={w.pos} x2={totalW} y2={w.pos}
+                                stroke="#60a5fa" strokeWidth={1.5} />
+                    ))}
+
+                    {/* Hover preview */}
+                    {hover && !wallExists(hover.axis, hover.pos) && (
+                        hover.axis === 'x'
+                            ? <line x1={hover.pos} y1={0} x2={hover.pos} y2={totalD}
+                                stroke="#3b82f6" strokeWidth={1} opacity={0.5} strokeDasharray="3,2" />
+                            : <line x1={0} y1={hover.pos} x2={totalW} y2={hover.pos}
+                                stroke="#3b82f6" strokeWidth={1} opacity={0.5} strokeDasharray="3,2" />
+                    )}
+                    {hover && wallExists(hover.axis, hover.pos) && (
+                        hover.axis === 'x'
+                            ? <line x1={hover.pos} y1={0} x2={hover.pos} y2={totalD}
+                                stroke="#ef4444" strokeWidth={2} opacity={0.6} />
+                            : <line x1={0} y1={hover.pos} x2={totalW} y2={hover.pos}
+                                stroke="#ef4444" strokeWidth={2} opacity={0.6} />
+                    )}
+
+                    {/* Outer border */}
+                    <rect x={0} y={0} width={totalW} height={totalD}
+                        fill="none" stroke="#9ca3af" strokeWidth={1} />
+                </svg>
+            </div>
+            <p className="text-[10px] text-gray-500 mt-1 text-center">Click grid lines to add/remove dividers</p>
+            {walls.length > 0 && (
+                <button onClick={() => onWallsChange([])}
+                    className="mt-2 w-full py-1 text-[10px] text-gray-400 hover:text-red-400 border border-gray-700 rounded transition-colors">
+                    Clear All Walls
+                </button>
+            )}
+        </div>
+    );
+}
+
 // --- Main App ---
 export default function App() {
   const mountRef = useRef(null);
@@ -428,8 +801,9 @@ export default function App() {
   const labelGroupRef = useRef(new THREE.Group());
   const cameraRef = useRef(null);
   
-  const [appMode, setAppMode] = useState('in'); 
+  const [appMode, setAppMode] = useState('in');
   const [showMeasure, setShowMeasure] = useState(true);
+  const [compartmentWalls, setCompartmentWalls] = useState([]);
   
   // DEFAULT CONFIG (Micron Native)
   const [config, setConfig] = useState({
@@ -569,10 +943,13 @@ export default function App() {
     dirLight.castShadow = true;
     scene.add(dirLight);
 
-    const bottomLight = new THREE.DirectionalLight(0xffffff, 0.5);
-    bottomLight.position.set(-10, -20, -10);
-    bottomLight.lookAt(0,0,0);
+    const bottomLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    bottomLight.position.set(5, -10, 8);
     scene.add(bottomLight);
+
+    const bottomLight2 = new THREE.DirectionalLight(0xffffff, 0.5);
+    bottomLight2.position.set(-8, -6, -5);
+    scene.add(bottomLight2);
     
     const gridHelper = new THREE.GridHelper(100, 100, 0x374151, 0x1f2937);
     scene.add(gridHelper);
@@ -684,44 +1061,21 @@ export default function App() {
     const gap = 30 * MM_TO_IN;
     const boxOffsetX = -(outerW / 2) - gap;
 
-    // 1. FEET
+    // 1. FEET (proper chamfered profile per Gridfinity spec)
     if (stack.feet) {
         const unitsX = config.gridWidth;
         const unitsZ = config.gridDepth;
         const GRID_IN = 42.0 * MM_TO_IN;
-        const topH = (2.15 * MM_TO_IN) + GEO_OVERLAP;
-        const botH = (2.85 * MM_TO_IN) + GEO_OVERLAP;
-        
-        // Magnet Holes
-        const addMagnetHoles = (shape) => {
-            const magR = (6.5 / 2) * MM_TO_IN; 
-            const magOff = 13.0 * MM_TO_IN;
-            // Clockwise winding = Hole
-            const h1 = new THREE.Path(); h1.absarc(-magOff, -magOff, magR, 0, Math.PI*2, true); shape.holes.push(h1);
-            const h2 = new THREE.Path(); h2.absarc(magOff, -magOff, magR, 0, Math.PI*2, true); shape.holes.push(h2);
-            const h3 = new THREE.Path(); h3.absarc(-magOff, magOff, magR, 0, Math.PI*2, true); shape.holes.push(h3);
-            const h4 = new THREE.Path(); h4.absarc(magOff, magOff, magR, 0, Math.PI*2, true); shape.holes.push(h4);
-        };
+        const footGeo = createGridfinityFootGeo(true);
 
-        const footTopShape = createRoundedRectPath(41.5 * MM_TO_IN, 41.5 * MM_TO_IN, 4.0 * MM_TO_IN);
-        addMagnetHoles(footTopShape);
-        const footTop = new THREE.ExtrudeGeometry(footTopShape, { depth: topH, bevelEnabled: false });
-        footTop.rotateX(-Math.PI/2);
-        
-        const footBotShape = createRoundedRectPath(37.5 * MM_TO_IN, 37.5 * MM_TO_IN, 2.0 * MM_TO_IN);
-        addMagnetHoles(footBotShape);
-        const footBot = new THREE.ExtrudeGeometry(footBotShape, { depth: botH, bevelEnabled: false });
-        footBot.rotateX(-Math.PI/2);
+        const startX = -(outerW / 2) + (GRID_IN / 2);
+        const startZ = -(outerD / 2) + (GRID_IN / 2);
 
-        const startX = -(outerW/2) + (GRID_IN/2);
-        const startZ = -(outerD/2) + (GRID_IN/2);
-
-        for(let i=0; i<unitsX; i++){
-            for(let j=0; j<unitsZ; j++){
+        for (let i = 0; i < unitsX; i++) {
+            for (let j = 0; j < unitsZ; j++) {
                 const cx = startX + (i * GRID_IN);
                 const cz = startZ + (j * GRID_IN);
-                addMesh(footBot, cx + boxOffsetX, stack.feet.yMin, cz);
-                addMesh(footTop, cx + boxOffsetX, stack.feet.yMin + (2.85 * MM_TO_IN) - GEO_OVERLAP, cz); 
+                addMesh(footGeo, cx + boxOffsetX, stack.feet.yMin, cz);
             }
         }
     }
@@ -843,17 +1197,10 @@ export default function App() {
         addMesh(cBack, boxOffsetX, cY + cH/2, -(outerD/2)+(capWidth/2));
     }
 
-    // 5. LIP
+    // 5. LIP (proper stepped profile matching foot inverse)
     if (stack.lip) {
-        const lH = stack.lip.yMax - stack.lip.yMin;
-        const lY = stack.lip.yMin + lH/2;
-        const th = 0.1; 
-        const side = new THREE.BoxGeometry(th, lH, outerD);
-        addMesh(side, boxOffsetX-(outerW/2)+(th/2), lY, 0);
-        addMesh(side, boxOffsetX+(outerW/2)-(th/2), lY, 0);
-        const fb = new THREE.BoxGeometry(outerW - (th*2), lH, th);
-        addMesh(fb, boxOffsetX, lY, -(outerD/2)+(th/2));
-        addMesh(fb, boxOffsetX, lY, (outerD/2)-(th/2));
+        const lipGeo = createGridfinityLipGeo(outerW, outerD);
+        addMesh(lipGeo, boxOffsetX, stack.lip.yMin, 0);
     }
 
     // 6. LID GEOMETRY
@@ -1096,6 +1443,17 @@ export default function App() {
                     </>
                 )}
             </div>
+
+            {isGridfinity && config.gridfinityType === 'bin' && (
+                <div className="mb-4 pt-4 border-t border-gray-700">
+                    <CompartmentEditor
+                        gridWidth={config.gridWidth}
+                        gridDepth={config.gridDepth}
+                        walls={compartmentWalls}
+                        onWallsChange={setCompartmentWalls}
+                    />
+                </div>
+            )}
 
             {(!isGridfinity || config.gridfinityType === 'bin') && (
                 <div className="mb-6 space-y-4 pt-4 border-t border-gray-700">
